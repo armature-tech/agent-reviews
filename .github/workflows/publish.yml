@@ -1,0 +1,224 @@
+name: Publish
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: publish-agent-reviews-npm
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify and publish to npm
+    if: github.repository == 'armature-tech/agent-reviews'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: npm-production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A run that fails after npm accepts the package leaves this commit's tag
+      # behind: the rerun completes that version instead of publishing another.
+      - name: Check whether this commit is already released
+        id: existing_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(git tag --points-at HEAD --list 'v*' | sort -V | tail -1 || true)"
+          if [[ -n "${tag}" ]] && gh release view "${tag}" >/dev/null 2>&1; then
+            echo "Commit ${GITHUB_SHA} is already released as ${tag}; skipping publish."
+            echo "published=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+            echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Setup Node
+        if: steps.existing_release.outputs.published != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          scope: "@armature-tech"
+
+      - name: Run checks
+        if: steps.existing_release.outputs.published != 'true'
+        run: npm run check
+
+      - name: Check npm release access
+        if: steps.existing_release.outputs.published != 'true'
+        id: npm_auth
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [[ -n "${NODE_AUTH_TOKEN}" ]]; then
+            echo "ready=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "ready=false" >> "${GITHUB_OUTPUT}"
+            echo "::warning::NPM_TOKEN is not set in the npm-production environment. The verified package was not published."
+          fi
+
+      - name: Resolve this commit's version
+        if: steps.existing_release.outputs.published != 'true' && steps.npm_auth.outputs.ready == 'true'
+        id: version
+        env:
+          COMMIT_TAG: ${{ steps.existing_release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+          const cp = require("node:child_process");
+
+          const pkgPath = "package.json";
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+          let nextVersion = (process.env.COMMIT_TAG || "").replace(/^v/, "");
+
+          if (!nextVersion) {
+            const versions = ["0.0.0"];
+
+            function addVersion(candidate) {
+              if (typeof candidate !== "string") return;
+              const normalized = candidate.trim().replace(/^v/, "");
+              if (/^\d+\.\d+\.\d+$/.test(normalized)) versions.push(normalized);
+            }
+
+            try {
+              const output = cp.execFileSync("npm", ["view", pkg.name, "versions", "--json"], {
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "pipe"],
+              });
+              const parsed = JSON.parse(output);
+              if (Array.isArray(parsed)) parsed.forEach(addVersion);
+              else addVersion(parsed);
+            } catch (error) {
+              console.warn(`No npm release exists yet for ${pkg.name}.`);
+            }
+
+            cp.execFileSync("git", ["fetch", "--tags", "--force"], { stdio: "ignore" });
+            const tags = cp.execFileSync("git", ["tag", "-l", "v*"], { encoding: "utf8" });
+            tags.split(/\r?\n/).forEach(addVersion);
+
+            function parse(version) {
+              const [major, minor, patch] = version.split(".").map((part) => Number.parseInt(part, 10));
+              return { major, minor, patch };
+            }
+
+            versions.sort((a, b) => {
+              const left = parse(a);
+              const right = parse(b);
+              return left.major - right.major || left.minor - right.minor || left.patch - right.patch;
+            });
+
+            const highest = parse(versions.at(-1));
+            nextVersion = highest.major === 0 && highest.minor === 0 && highest.patch === 0
+              ? "0.1.0"
+              : `${highest.major}.${highest.minor}.${highest.patch + 1}`;
+            // The tag goes up before npm sees the package, so this commit keeps
+            // its version if a later step fails.
+            cp.execFileSync("git", ["tag", `v${nextVersion}`, process.env.GITHUB_SHA], { stdio: "inherit" });
+            cp.execFileSync("git", ["push", "origin", `refs/tags/v${nextVersion}`], { stdio: "inherit" });
+          }
+
+          let onNpm = false;
+          try {
+            onNpm = cp.execFileSync("npm", ["view", `${pkg.name}@${nextVersion}`, "version"], {
+              encoding: "utf8",
+              stdio: ["ignore", "pipe", "pipe"],
+            }).trim() === nextVersion;
+          } catch {}
+
+          pkg.version = nextVersion;
+          delete pkg.private;
+          fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `next_version=${nextVersion}\non_npm=${onNpm}\n`);
+          console.log(`Preparing ${pkg.name}@${nextVersion}${onNpm ? ", already on npm" : ""}`);
+          NODE
+
+      - name: Pack the exact release file
+        if: steps.existing_release.outputs.published != 'true' && steps.npm_auth.outputs.ready == 'true' && steps.version.outputs.on_npm != 'true'
+        id: pack
+        run: |
+          set -euo pipefail
+          npm pack --json --ignore-scripts > "${RUNNER_TEMP}/pack.json"
+          node - "${RUNNER_TEMP}/pack.json" <<'NODE'
+          const [pack] = require(process.argv[2]);
+          const files = pack.files.map((file) => file.path).sort();
+          const expected = ["LICENSE", "README.md", "bin/agent-reviews.js", "lib/cli.js", "package.json"];
+          if (JSON.stringify(files) !== JSON.stringify(expected)) {
+            console.error(`Unexpected package files: ${files.join(", ")}`);
+            process.exit(1);
+          }
+          NODE
+          tarball="$(node -e 'const p=require(process.argv[1]); process.stdout.write(p[0].filename)' "${RUNNER_TEMP}/pack.json")"
+          sha256sum "${tarball}" | tee "${tarball}.sha256"
+          echo "artifact=${PWD}/${tarball}" >> "${GITHUB_OUTPUT}"
+          echo "checksum=${PWD}/${tarball}.sha256" >> "${GITHUB_OUTPUT}"
+
+      - name: Install and run the exact release file
+        if: steps.existing_release.outputs.published != 'true' && steps.npm_auth.outputs.ready == 'true' && steps.version.outputs.on_npm != 'true'
+        env:
+          NEXT_VERSION: ${{ steps.version.outputs.next_version }}
+        run: |
+          set -euo pipefail
+          canary="${RUNNER_TEMP}/canary"
+          mkdir -p "${canary}"
+          npm install --prefix "${canary}" --ignore-scripts --no-audit --no-fund "${{ steps.pack.outputs.artifact }}"
+          version="$("${canary}/node_modules/.bin/agent-reviews" --version)"
+          [[ "${version}" == "${NEXT_VERSION}" ]] || { echo "The installed command says ${version}, not ${NEXT_VERSION}." >&2; exit 1; }
+          "${canary}/node_modules/.bin/agent-reviews" --help | grep -q 'npx @armature-tech/agent-reviews login'
+
+      - name: Take the file npm already has
+        if: steps.existing_release.outputs.published != 'true' && steps.npm_auth.outputs.ready == 'true' && steps.version.outputs.on_npm == 'true'
+        id: published
+        env:
+          NEXT_VERSION: ${{ steps.version.outputs.next_version }}
+        run: |
+          set -euo pipefail
+          npm pack "@armature-tech/agent-reviews@${NEXT_VERSION}" --json > "${RUNNER_TEMP}/published.json"
+          tarball="$(node -e 'const p=require(process.argv[1]); process.stdout.write(p[0].filename)' "${RUNNER_TEMP}/published.json")"
+          sha256sum "${tarball}" | tee "${tarball}.sha256"
+          echo "artifact=${PWD}/${tarball}" >> "${GITHUB_OUTPUT}"
+          echo "checksum=${PWD}/${tarball}.sha256" >> "${GITHUB_OUTPUT}"
+
+      - name: Save verified release files
+        if: steps.existing_release.outputs.published != 'true' && steps.npm_auth.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-reviews-${{ steps.version.outputs.next_version }}
+          path: |
+            ${{ steps.pack.outputs.artifact || steps.published.outputs.artifact }}
+            ${{ steps.pack.outputs.checksum || steps.published.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish exact release file
+        if: steps.existing_release.outputs.published != 'true' && steps.npm_auth.outputs.ready == 'true' && steps.version.outputs.on_npm != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish "${{ steps.pack.outputs.artifact }}" --access public --provenance --ignore-scripts
+
+      - name: Create matching GitHub release
+        if: steps.existing_release.outputs.published != 'true' && steps.npm_auth.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_VERSION: ${{ steps.version.outputs.next_version }}
+          ARTIFACT: ${{ steps.pack.outputs.artifact || steps.published.outputs.artifact }}
+          CHECKSUM: ${{ steps.pack.outputs.checksum || steps.published.outputs.checksum }}
+        run: |
+          gh release create "v${NEXT_VERSION}" \
+            "${ARTIFACT}" \
+            "${CHECKSUM}" \
+            --verify-tag \
+            --title "v${NEXT_VERSION}" \
+            --notes "Published @armature-tech/agent-reviews@${NEXT_VERSION} from ${GITHUB_SHA}."

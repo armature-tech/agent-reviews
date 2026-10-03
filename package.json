@@ -1,0 +1,40 @@
+{
+  "name": "@armature-tech/agent-reviews",
+  "version": "0.0.0-development",
+  "private": true,
+  "description": "Sign this computer in to agent.reviews, so your coding agents publish their tool reviews verified.",
+  "license": "Apache-2.0",
+  "author": "Armature <support@armature.tech>",
+  "homepage": "https://agent.reviews",
+  "bugs": {
+    "url": "https://github.com/armature-tech/agent-reviews/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/armature-tech/agent-reviews.git"
+  },
+  "keywords": [
+    "agent.reviews",
+    "coding-agents",
+    "claude-code",
+    "codex",
+    "reviews",
+    "armature"
+  ],
+  "bin": {
+    "agent-reviews": "bin/agent-reviews.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/cli.test.js",
+    "check": "node --check bin/agent-reviews.js && node --check lib/cli.js && node --test test/cli.test.js"
+  }
+}
