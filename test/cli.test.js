@@ -54,6 +54,7 @@ function harness(t, base, extra = {}) {
   let interrupt = null;
   const io = {
     api: base,
+    interactive: true,
     env: { DISPLAY: ':0' },
     platform: 'linux',
     home,
@@ -67,7 +68,7 @@ function harness(t, base, extra = {}) {
     ...extra,
   };
   const file = path.join(home, '.armature', 'agent-review.json');
-  return { io, home, file, out, err, delays, opened, interrupt: () => interrupt && interrupt() };
+  return { io, home, file, out, err, delays, opened, interrupt: (signal) => interrupt && interrupt(signal) };
 }
 
 test('login saves the token where every agent reads it, for this user only, and keeps the other fields', async (t) => {
@@ -103,6 +104,62 @@ test('login saves the token where every agent reads it, for this user only, and 
   assert.match(said, /Signed in\. Every coding agent on this computer now publishes its reviews verified\./);
   // The token goes to the file only, never to the screen.
   assert.doesNotMatch([...h.out, ...h.err].join('\n'), /arv_t/);
+});
+
+test('run by an agent, login prints its link, keeps it for check and returns', async (t) => {
+  const api = await mockApi(t, [link(), [200, { status: 'pending' }], [200, { status: 'approved', token: TOKEN }]]);
+  const h = harness(t, api.base, { interactive: false });
+  seed(h, { automatic_reviews: 'declined' });
+  assert.equal(await main(['login'], h.io), 0);
+  assert.deepEqual(api.requests.map((r) => r.body), [{ action: 'login' }]);
+  // Nothing waits: no timer, no Ctrl+C.
+  assert.deepEqual(h.delays, []);
+  const kept = record(h).pending_sign_in;
+  assert.deepEqual(kept, { device_code: DEVICE, check_url: `${api.base}/api/agent-review/sign-in`, url: 'https://agent.reviews/verify?code=BCDF-GHJK', code: 'BCDF-GHJK', expires_at: kept.expires_at });
+  assert.equal(record(h).automatic_reviews, 'declined');
+  const said = h.out.join('\n');
+  assert.match(said, /Open {2}https:\/\/agent\.reviews\/verify\?code=BCDF-GHJK/);
+  assert.match(said, /Show the person this link and code\. Once they approve it, run:\n {2}npx -y @armature-tech\/agent-reviews check\n/);
+  assert.doesNotMatch(said, /Waiting|Ctrl\+C|arvd_/);
+  assert.deepEqual(h.opened, ['https://agent.reviews/verify?code=BCDF-GHJK']);
+
+  // Run again while the link waits: the same link, and no second browser tab.
+  h.out.length = 0;
+  assert.equal(await main(['login'], h.io), 0);
+  assert.deepEqual(api.requests.at(-1).body, { device_code: DEVICE, action: 'token' });
+  assert.match(h.out.join('\n'), /Code {2}BCDF-GHJK/);
+  assert.equal(h.opened.length, 1);
+  // Once the person approved it, the sign-in.
+  assert.equal(await main(['login'], h.io), 0);
+  assert.deepEqual(record(h), { automatic_reviews: 'declined', token: TOKEN });
+  assert.match(h.out.at(-1), /^Signed in\./);
+  assert.equal(api.requests.length, 3);
+  assert.doesNotMatch([...h.out, ...h.err].join('\n'), /arv_t/);
+});
+
+test('login run again after a review joined its link shows the same link', async (t) => {
+  const expires = new Date(Date.now() + 600000).toISOString();
+  const joined = { ...LINK, expires_at: expires };
+  const api = await mockApi(t, [link({ expires_at: expires }), [200, { status: 'pending' }], receipt({ publishes_at: expires, sign_in: joined }), [200, { status: 'pending' }]]);
+  const h = harness(t, api.base, { interactive: false, readStdin: async () => JSON.stringify(REVIEW) });
+  assert.equal(await main(['login'], h.io), 0);
+  assert.equal(await main(['submit'], h.io), 0);
+  assert.equal(api.requests[2].body.client.sign_in, DEVICE);
+  h.out.length = 0;
+  assert.equal(await main(['login'], h.io), 0);
+  // No new link: the one the person has, checked once.
+  assert.deepEqual(api.requests.slice(3).map((r) => r.body), [{ device_code: DEVICE, action: 'token' }]);
+  assert.match(h.out.join('\n'), /Code {2}BCDF-GHJK/);
+});
+
+test('an agent’s time limit stops the wait but keeps the link for check', async (t) => {
+  let h;
+  const api = await mockApi(t, [link(), () => { h.interrupt('SIGTERM'); return [200, { status: 'pending' }]; }]);
+  h = harness(t, api.base);
+  assert.equal(await main(['login'], h.io), 143);
+  assert.equal(api.requests.length, 2);
+  assert.equal(record(h).pending_sign_in.device_code, DEVICE);
+  assert.match(h.out.at(-1), /Stopped waiting\. Once the link is approved, npx @armature-tech\/agent-reviews check saves the sign-in\./);
 });
 
 test('a link approved in its last seconds still hands over its token', async (t) => {
@@ -215,19 +272,45 @@ test('submit sends a signed-in review with the token, and never prints it', asyn
 });
 
 test('submit without a sign-in asks for a link, keeps it for the next review and for check, and shows no device code', async (t) => {
-  const api = await mockApi(t, [receipt({ publishes_at: LINK.expires_at, sign_in: LINK }), receipt({ publishes_at: LINK.expires_at, sign_in: LINK })]);
+  const api = await mockApi(t, [receipt({ publishes_at: LINK.expires_at, sign_in: LINK }), [200, { status: 'pending', expires_at: LINK.expires_at }], receipt({ publishes_at: LINK.expires_at, sign_in: LINK })]);
   const h = harness(t, api.base, { readStdin: async () => JSON.stringify(REVIEW) });
   assert.equal(await main(['submit'], h.io), 0);
   assert.equal(api.requests[0].authorization, undefined);
   assert.equal(api.requests[0].body.client.sign_in, true);
-  assert.deepEqual(record(h), { pending_sign_in: { device_code: DEVICE, check_url: `${api.base}/api/agent-review/sign-in` } });
+  assert.deepEqual(record(h), { pending_sign_in: { device_code: DEVICE, check_url: `${api.base}/api/agent-review/sign-in`, url: LINK.url, code: LINK.code, expires_at: LINK.expires_at } });
   assert.equal(fs.statSync(h.file).mode & 0o777, 0o600);
   const shown = JSON.parse(h.out.join('\n'));
   assert.deepEqual(shown.sign_in, { url: LINK.url, code: LINK.code, expires_at: LINK.expires_at });
   assert.doesNotMatch(h.out.join('\n'), /arvd_/);
   // The next review joins the link that waits, so one sign-in covers both.
+  api.requests.length = 0;
   assert.equal(await main(['submit', '-'], h.io), 0);
+  assert.deepEqual(api.requests.map((r) => r.path), ['/api/agent-review/sign-in', '/api/agent-review']);
+  assert.deepEqual(api.requests[0].body, { device_code: DEVICE, action: 'token' });
   assert.equal(api.requests[1].body.client.sign_in, DEVICE);
+});
+
+test('submit saves a sign-in the person approved before it sends, and forgets a link that is over', async (t) => {
+  const api = await mockApi(t, [
+    [200, { status: 'approved', token: TOKEN }],
+    receipt({ verified: true }),
+    [200, { status: 'expired' }],
+    receipt({ publishes_at: LINK.expires_at, sign_in: { ...LINK, device_code: `arvd_${'e'.repeat(43)}` } }),
+  ]);
+  const h = harness(t, api.base, { readStdin: async () => JSON.stringify(REVIEW) });
+  seed(h, { sign_in: 'asked', pending_sign_in: { device_code: DEVICE } });
+  assert.equal(await main(['submit'], h.io), 0);
+  // Approved: the review goes with the sign-in, and publishes verified.
+  assert.equal(api.requests[1].authorization, `Bearer ${TOKEN}`);
+  assert.deepEqual(api.requests[1].body.client, { idempotency_key: 'k-1' });
+  assert.deepEqual(record(h), { token: TOKEN });
+  assert.doesNotMatch(h.out.join('\n'), /arv_t/);
+
+  // Over: the review asks for a new link.
+  seed(h, { pending_sign_in: { device_code: DEVICE } });
+  assert.equal(await main(['submit'], h.io), 0);
+  assert.equal(api.requests[3].body.client.sign_in, true);
+  assert.equal(record(h).pending_sign_in.device_code, `arvd_${'e'.repeat(43)}`);
 });
 
 test('submit sends no link once the person declined, and drops a revoked token', async (t) => {
@@ -246,7 +329,7 @@ test('submit sends no link once the person declined, and drops a revoked token',
   assert.equal(await main(['submit'], two.io), 0);
   assert.equal(revoked.requests[1].authorization, undefined);
   assert.equal(revoked.requests[1].body.client.sign_in, true);
-  assert.deepEqual(record(two), { automatic_reviews: 'declined', pending_sign_in: { device_code: DEVICE, check_url: `${revoked.base}/api/agent-review/sign-in` } });
+  assert.deepEqual(record(two), { automatic_reviews: 'declined', pending_sign_in: { device_code: DEVICE, check_url: `${revoked.base}/api/agent-review/sign-in`, url: LINK.url, code: LINK.code, expires_at: LINK.expires_at } });
 });
 
 test('submit waits out a short limit once, and reports a long one or a refusal', async (t) => {
@@ -355,6 +438,20 @@ test('check publish and check cancel close the link', async (t) => {
   assert.deepEqual(record(h), { automatic_reviews: 'declined' });
   assert.equal(await main(['check'], h.io), 0);
   assert.deepEqual(JSON.parse(h.out.pop()), { status: 'none' });
+});
+
+test('a link from login stays open after publish or cancel, and says how many reviews moved', async (t) => {
+  const api = await mockApi(t, [
+    [200, { status: 'pending', expires_at: LINK.expires_at, published: 2 }],
+    [200, { status: 'pending', expires_at: LINK.expires_at, withdrawn: 1 }],
+  ]);
+  const h = harness(t, api.base);
+  seed(h, { pending_sign_in: { device_code: DEVICE } });
+  assert.equal(await main(['check', 'publish'], h.io), 0);
+  assert.deepEqual(JSON.parse(h.out.pop()), { status: 'pending', expires_at: LINK.expires_at, published: 2 });
+  assert.equal(await main(['check', 'cancel'], h.io), 0);
+  assert.deepEqual(JSON.parse(h.out.pop()), { status: 'pending', expires_at: LINK.expires_at, withdrawn: 1 });
+  assert.deepEqual(record(h), { pending_sign_in: { device_code: DEVICE } });
 });
 
 test('publish or cancel after the person approved saves the sign-in, and a late cancel says the reviews are public', async (t) => {
