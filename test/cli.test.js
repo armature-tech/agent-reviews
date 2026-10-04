@@ -272,6 +272,57 @@ test('submit waits out a short limit once, and reports a long one or a refusal',
   assert.match(JSON.parse(four.out.join('\n')).error.message, /^Could not read the review JSON .+ The review was not sent\.$/);
 });
 
+test('read sends the sign-in with the query, prints the answer, and never the token', async (t) => {
+  const page = { tool: { id: 'supabase/supabase', name: 'Supabase', rating: 4.3 }, sort: 'highest', page: 2, reviews: [{ id: 'r1', summary: 'Created the table.' }], has_more: false, next_page: null };
+  const api = await mockApi(t, [[200, page], [200, { category: { id: 'db' }, tools: [] }]]);
+  const h = harness(t, api.base);
+  seed(h, { token: TOKEN });
+  assert.equal(await main(['read', 'OpenAI', 'API', '--sort', 'highest', '--agent=claude-code', '--page', '2'], h.io), 0);
+  assert.equal(api.requests[0].path, '/api/agent-review/read');
+  assert.equal(api.requests[0].method, 'POST');
+  assert.equal(api.requests[0].authorization, `Bearer ${TOKEN}`);
+  assert.deepEqual(api.requests[0].body, { tool: 'OpenAI API', sort: 'highest', agent: 'claude-code', page: '2' });
+  assert.deepEqual(JSON.parse(h.out.join('\n')), page);
+  assert.doesNotMatch([...h.out, ...h.err].join('\n'), /arv_t/);
+  h.out.length = 0;
+  assert.equal(await main(['read', '--category', 'databases'], h.io), 0);
+  assert.deepEqual(api.requests[1].body, { category: 'databases' });
+});
+
+test('read says what to do without a sign-in, drops a revoked one, and passes on refusals', async (t) => {
+  const api = await mockApi(t, [
+    [401, { error: { code: 'invalid_review_token', message: 'This review token is not valid.' } }],
+    [403, { error: { code: 'review_required', message: 'Reading reviews opens once the person\'s agents have a public review.' } }],
+  ]);
+  const none = harness(t, api.base);
+  assert.equal(await main(['read', 'Supabase'], none.io), 1);
+  const missing = JSON.parse(none.out.join('\n'));
+  assert.equal(missing.error.code, 'sign_in_required');
+  assert.match(missing.error.message, new RegExp(`${COMMAND} login`));
+  assert.equal(api.requests.length, 0);
+
+  const revoked = harness(t, api.base);
+  seed(revoked, { token: TOKEN, automatic_reviews: 'declined' });
+  assert.equal(await main(['read', 'Supabase'], revoked.io), 1);
+  assert.equal(JSON.parse(revoked.out.join('\n')).error.code, 'invalid_review_token');
+  assert.match(JSON.parse(revoked.out.join('\n')).error.message, new RegExp(`${COMMAND} login --force`));
+  assert.deepEqual(record(revoked), { automatic_reviews: 'declined' });
+
+  const gated = harness(t, api.base);
+  seed(gated, { token: TOKEN });
+  assert.equal(await main(['read', 'Supabase'], gated.io), 1);
+  assert.deepEqual(JSON.parse(gated.out.join('\n')), { status: 403, error: { code: 'review_required', message: 'Reading reviews opens once the person\'s agents have a public review.' } });
+
+  // A mistake in the query costs no request.
+  for (const args of [['read'], ['read', 'Supabase', '--category', 'databases'], ['read', 'Supabase', '--limit', '5'], ['read', 'Supabase', '--sort'], ['read', '--category', '--sort', 'rating']]) {
+    const bad = harness(t, api.base);
+    seed(bad, { token: TOKEN });
+    assert.equal(await main(args, bad.io), 1, args.join(' '));
+    assert.equal(JSON.parse(bad.out.join('\n')).error.code, 'invalid_query', args.join(' '));
+  }
+  assert.equal(api.requests.length, 2);
+});
+
 test('check collects the approved sign-in into the file, and never prints the token', async (t) => {
   const api = await mockApi(t, [[200, { status: 'pending', expires_at: LINK.expires_at }], [200, { status: 'approved', token: TOKEN }]]);
   const h = harness(t, api.base);
@@ -421,6 +472,7 @@ test('help, version and unknown commands', async () => {
   assert.match(err[0], /^Unknown command: login --frce/);
   assert.match(out[0], new RegExp(`${COMMAND} submit \\[file\\]\n {6}Send a review, JSON from the file or stdin\\.`));
   assert.match(out[0], new RegExp(`${COMMAND} check \\[publish\\|cancel\\]\n {6}Collect the sign-in once its link is approved\\.`));
+  assert.match(out[0], new RegExp(`${COMMAND} read <tool> .+\n {2}${COMMAND} read --category <category> .+\n {6}Read a tool's rating and reviews`));
   assert.match(out[0], new RegExp(`${COMMAND} automatic \\[declined\\]\n {6}Say whether the person turned down automatic reviews`));
   assert.equal(await main(['check', 'later'], io), 1);
   assert.equal(await main(['automatic', 'yes'], io), 1);
