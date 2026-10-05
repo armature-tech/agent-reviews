@@ -58,6 +58,7 @@ function harness(t, base, extra = {}) {
     env: { DISPLAY: ':0' },
     platform: 'linux',
     home,
+    cwd: home,
     setTimer: (fn, ms) => { delays.push(ms); return setImmediate(fn); },
     sleep: async (ms) => { delays.push(ms); },
     clearTimer: (timer) => clearImmediate(timer),
@@ -416,6 +417,77 @@ test('read sends the sign-in with the query, prints the answer, and never the to
   assert.deepEqual(api.requests[1].body, { category: 'databases' });
 });
 
+test('lookup, compare, search and category send their reads with the sign-in', async (t) => {
+  const answer = { tool: { name: 'Inngest' } };
+  const api = await mockApi(t, [[200, answer], [200, answer], [200, answer], [200, answer]]);
+  const h = harness(t, api.base);
+  seed(h, { token: TOKEN });
+  assert.equal(await main(['lookup', 'Amazon', 'S3'], h.io), 0);
+  assert.equal(await main(['compare', 'Inngest', 'Trigger.dev', 'Temporal Cloud'], h.io), 0);
+  assert.equal(await main(['search', 'background', 'jobs'], h.io), 0);
+  assert.equal(await main(['category', 'databases'], h.io), 0);
+  assert.deepEqual(api.requests.map((r) => [r.path, r.authorization, r.body]), [
+    ['/api/agent-review/read', `Bearer ${TOKEN}`, { tool: 'Amazon S3' }],
+    ['/api/agent-review/read', `Bearer ${TOKEN}`, { tools: ['Inngest', 'Trigger.dev', 'Temporal Cloud'] }],
+    ['/api/agent-review/read', `Bearer ${TOKEN}`, { query: 'background jobs' }],
+    ['/api/agent-review/read', `Bearer ${TOKEN}`, { category: 'databases' }],
+  ]);
+  assert.deepEqual(JSON.parse(h.out[0]), answer);
+  assert.doesNotMatch([...h.out, ...h.err].join('\n'), /arv_t/);
+  // Words that do not fit cost no request.
+  for (const args of [['lookup'], ['compare', 'Inngest'], ['compare', 'A', 'B', 'C', 'D', 'E'], ['search'], ['category'], ['lookup', 'Supabase', '--sort', 'recent']]) {
+    const bad = harness(t, api.base);
+    seed(bad, { token: TOKEN });
+    assert.equal(await main(args, bad.io), 1, args.join(' '));
+    const said = JSON.parse(bad.out.join('\n'));
+    assert.equal(said.error.code, 'invalid_query', args.join(' '));
+    assert.match(said.error.message, new RegExp(`^Usage: ${COMMAND} ${args[0]} `), args.join(' '));
+  }
+  assert.equal(api.requests.length, 4);
+});
+
+test('reads and reviews say when the skills here are older than the server\'s, and never print its list', async (t) => {
+  const latest = { 'agent-review': '2.9.0', 'tool-reviews': '1.0.0' };
+  const api = await mockApi(t, Array.from({ length: 6 }, () => [200, { tool: { name: 'Supabase' }, latest_skills: latest }]));
+  const skill = (root, folder, name, version) => {
+    fs.mkdirSync(path.join(root, folder, name), { recursive: true });
+    fs.writeFileSync(path.join(root, folder, name, 'SKILL.md'), `---\nname: ${name}\ndescription: x\nmetadata:\n  version: "${version}"\n---\n# ${name}\n`);
+  };
+  const run = async (h) => {
+    h.out.length = 0;
+    assert.equal(await main(['lookup', 'Supabase'], h.io), 0);
+    return JSON.parse(h.out.join('\n'));
+  };
+  // No skill found (an MCP reader, or skills kept elsewhere): no hint.
+  const bare = harness(t, api.base);
+  seed(bare, { token: TOKEN });
+  assert.deepEqual(await run(bare), { tool: { name: 'Supabase' } });
+  // An older review skill, and the lookup skill missing.
+  const old = harness(t, api.base);
+  seed(old, { token: TOKEN });
+  skill(old.home, '.claude/skills', 'agent-review', '2.8.1');
+  const hinted = await run(old);
+  assert.equal(hinted.latest_skills, undefined);
+  assert.deepEqual(hinted.skill_update.installed, { 'agent-review': '2.8.1', 'tool-reviews': null });
+  assert.equal(hinted.skill_update.command, 'npx -y skills add https://agent.reviews/skills -g -y -a claude-code -a codex -a cursor');
+  assert.match(hinted.skill_update.message, /agent-review 2\.9\.0, tool-reviews 1\.0\.0/);
+  // Both current in one folder, an old copy in a project: the old copy decides.
+  const mixed = harness(t, api.base);
+  seed(mixed, { token: TOKEN });
+  skill(mixed.home, '.agents/skills', 'agent-review', '2.9.0');
+  skill(mixed.home, '.agents/skills', 'tool-reviews', '1.0.0');
+  assert.equal((await run(mixed)).skill_update, undefined);
+  skill(mixed.home, 'project/.cursor/skills', 'tool-reviews', '0.9.0');
+  mixed.io.cwd = path.join(mixed.home, 'project');
+  assert.deepEqual((await run(mixed)).skill_update.installed, { 'agent-review': '2.9.0', 'tool-reviews': '0.9.0' });
+  // 2.10.0 is newer than 2.9.0.
+  const newer = harness(t, api.base);
+  seed(newer, { token: TOKEN });
+  skill(newer.home, '.claude/skills', 'agent-review', '2.10.0');
+  skill(newer.home, '.claude/skills', 'tool-reviews', '1.0.0');
+  assert.equal((await run(newer)).skill_update, undefined);
+});
+
 test('read says what to do without a sign-in, drops a revoked one, and passes on refusals', async (t) => {
   const api = await mockApi(t, [
     [401, { error: { code: 'invalid_review_token', message: 'This review token is not valid.' } }],
@@ -613,7 +685,12 @@ test('help, version and unknown commands', async () => {
   assert.match(err[0], /^Unknown command: login --frce/);
   assert.match(out[0], new RegExp(`${COMMAND} submit \\[file\\]\n {6}Send a review, JSON from the file or stdin\\.`));
   assert.match(out[0], new RegExp(`${COMMAND} check \\[publish\\|cancel\\]\n {6}Collect the sign-in once its link is approved\\.`));
-  assert.match(out[0], new RegExp(`${COMMAND} read <tool> .+\n {2}${COMMAND} read --category <category> .+\n {6}Read a tool's rating and reviews`));
+  assert.match(out[0], new RegExp(`${COMMAND} lookup <tool>\n {6}A tool's rating and numbers`));
+  assert.match(out[0], new RegExp(`${COMMAND} compare <tool> <tool> \\[<tool> <tool>\\]\n {6}Two to four tools side by side`));
+  assert.match(out[0], new RegExp(`${COMMAND} search <words>\n {6}Reviewed tools and categories`));
+  assert.match(out[0], new RegExp(`${COMMAND} category <category>\n {6}A category's ten best rated tools\.`));
+  // read stays for skills before 2.9.0, but help names lookup.
+  assert.doesNotMatch(out[0], new RegExp(`${COMMAND} read `));
   assert.match(out[0], new RegExp(`${COMMAND} automatic \\[declined\\]\n {6}Say whether the person turned down automatic reviews`));
   assert.equal(await main(['check', 'later'], io), 1);
   assert.equal(await main(['automatic', 'yes'], io), 1);
