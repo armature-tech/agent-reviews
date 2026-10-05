@@ -469,8 +469,10 @@ test('reads and reviews say when the skills here are older than the server\'s, a
   const hinted = await run(old);
   assert.equal(hinted.latest_skills, undefined);
   assert.deepEqual(hinted.skill_update.installed, { 'agent-review': '2.8.1', 'tool-reviews': null });
-  assert.equal(hinted.skill_update.command, 'npx -y skills add https://agent.reviews/skills -g -y -a claude-code -a codex -a cursor');
+  assert.equal(hinted.skill_update.command, 'npx -y skills add https://agent.reviews/skills -g -y -a universal -a claude-code');
   assert.match(hinted.skill_update.message, /agent-review 2\.9\.0, tool-reviews 1\.0\.0/);
+  // The command rewrites ~/.claude/skills, so no copy is left over.
+  assert.equal(hinted.skill_update.older_copies, undefined);
   // Both current in one folder, an old copy in a project: the old copy decides.
   const mixed = harness(t, api.base);
   seed(mixed, { token: TOKEN });
@@ -479,7 +481,11 @@ test('reads and reviews say when the skills here are older than the server\'s, a
   assert.equal((await run(mixed)).skill_update, undefined);
   skill(mixed.home, 'project/.cursor/skills', 'tool-reviews', '0.9.0');
   mixed.io.cwd = path.join(mixed.home, 'project');
-  assert.deepEqual((await run(mixed)).skill_update.installed, { 'agent-review': '2.9.0', 'tool-reviews': '0.9.0' });
+  const project = (await run(mixed)).skill_update;
+  assert.deepEqual(project.installed, { 'agent-review': '2.9.0', 'tool-reviews': '0.9.0' });
+  // The command never writes a project's folder: the answer names that copy.
+  assert.deepEqual(project.older_copies, ['./.cursor/skills/tool-reviews']);
+  assert.match(project.message, /does not update \.\/\.cursor\/skills\/tool-reviews: with their agreement, replace each SKILL\.md there with https:\/\/agent\.reviews\/skills\/\.well-known\/agent-skills\/<name>\/SKILL\.md, or delete the folder\./);
   // 2.10.0 is newer than 2.9.0.
   const newer = harness(t, api.base);
   seed(newer, { token: TOKEN });
@@ -685,10 +691,10 @@ test('help, version and unknown commands', async () => {
   assert.match(err[0], /^Unknown command: login --frce/);
   assert.match(out[0], new RegExp(`${COMMAND} submit \\[file\\]\n {6}Send a review, JSON from the file or stdin\\.`));
   assert.match(out[0], new RegExp(`${COMMAND} check \\[publish\\|cancel\\]\n {6}Collect the sign-in once its link is approved\\.`));
-  assert.match(out[0], new RegExp(`${COMMAND} lookup <tool>\n {6}A tool's rating and numbers`));
+  assert.match(out[0], new RegExp(`${COMMAND} lookup <tool>\n {6}How coding agents got on setting up and using a tool`));
   assert.match(out[0], new RegExp(`${COMMAND} compare <tool> <tool> \\[<tool> <tool>\\]\n {6}Two to four tools side by side`));
   assert.match(out[0], new RegExp(`${COMMAND} search <words>\n {6}Reviewed tools and categories`));
-  assert.match(out[0], new RegExp(`${COMMAND} category <category>\n {6}A category's ten best rated tools\.`));
+  assert.match(out[0], new RegExp(`${COMMAND} category <category>\n {6}A category's ten tools that agents rated best to set up and use\.`));
   // read stays for skills before 2.9.0, but help names lookup.
   assert.doesNotMatch(out[0], new RegExp(`${COMMAND} read `));
   assert.match(out[0], new RegExp(`${COMMAND} automatic \\[declined\\]\n {6}Say whether the person turned down automatic reviews`));
