@@ -313,6 +313,50 @@ test('submit saves a sign-in the person approved before it sends, and forgets a 
   assert.equal(record(h).pending_sign_in.device_code, `arvd_${'e'.repeat(43)}`);
 });
 
+test('while a forced login waits, a review joins its link instead of the old sign-in', async (t) => {
+  // Devin, #2455: the agent runs login --force on a computer signed in as
+  // someone else, then reviews before the person approves.
+  const OLD = `arv_${'o'.repeat(43)}`;
+  const api = await mockApi(t, [
+    [200, { status: 'pending', expires_at: LINK.expires_at }],
+    receipt({ publishes_at: LINK.expires_at, sign_in: LINK }),
+    [200, { status: 'approved', token: TOKEN }],
+    receipt({ verified: true }),
+  ]);
+  const h = harness(t, api.base, { readStdin: async () => JSON.stringify(REVIEW) });
+  seed(h, { token: OLD, pending_sign_in: { device_code: DEVICE } });
+  assert.equal(await main(['submit'], h.io), 0);
+  assert.deepEqual(api.requests.map((r) => r.path), ['/api/agent-review/sign-in', '/api/agent-review']);
+  assert.equal(api.requests[1].authorization, undefined);
+  assert.equal(api.requests[1].body.client.sign_in, DEVICE);
+  // Approved: the new sign-in replaces the old one, and the next review uses it.
+  assert.equal(await main(['submit'], h.io), 0);
+  assert.equal(api.requests[3].authorization, `Bearer ${TOKEN}`);
+  assert.equal(record(h).token, TOKEN);
+  assert.equal(record(h).pending_sign_in, undefined);
+});
+
+test('a link approved while a review was sent keeps its sign-in, and the review gets a link of its own', async (t) => {
+  // Devin, #2455: the person approves between the check and the send, so the
+  // review cannot join the link and the server starts another.
+  const OLD = `arv_${'o'.repeat(43)}`;
+  const NEW = { ...LINK, device_code: `arvd_${'n'.repeat(43)}` };
+  const api = await mockApi(t, [
+    [200, { status: 'pending', expires_at: LINK.expires_at }],
+    receipt({ publishes_at: LINK.expires_at, sign_in: NEW }),
+    [200, { status: 'approved', token: TOKEN }],
+  ]);
+  const h = harness(t, api.base, { readStdin: async () => JSON.stringify(REVIEW) });
+  seed(h, { token: OLD, pending_sign_in: { device_code: DEVICE } });
+  assert.equal(await main(['submit'], h.io), 0);
+  assert.deepEqual(api.requests.map((r) => r.path), ['/api/agent-review/sign-in', '/api/agent-review', '/api/agent-review/sign-in']);
+  assert.deepEqual(api.requests[2].body, { device_code: DEVICE, action: 'token' });
+  assert.deepEqual(record(h), { token: TOKEN });
+  // the review's own link is still shown, for the person to verify it
+  assert.equal(JSON.parse(h.out.join('\n')).sign_in.url, NEW.url);
+  assert.doesNotMatch(h.out.join('\n'), /arvd_|arv_/);
+});
+
 test('submit sends no link once the person declined, and drops a revoked token', async (t) => {
   const declined = await mockApi(t, [receipt()]);
   const one = harness(t, declined.base, { readStdin: async () => JSON.stringify(REVIEW) });
