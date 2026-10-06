@@ -448,7 +448,7 @@ test('lookup, compare, search and category send their reads with the sign-in', a
 
 test('reads and reviews say when the skills here are older than the server\'s, and never print its list', async (t) => {
   const latest = { 'agent-review': '2.9.0', 'tool-reviews': '1.0.0' };
-  const api = await mockApi(t, Array.from({ length: 6 }, () => [200, { tool: { name: 'Supabase' }, latest_skills: latest }]));
+  const api = await mockApi(t, Array.from({ length: 8 }, () => [200, { tool: { name: 'Supabase' }, latest_skills: latest }]));
   const skill = (root, folder, name, version) => {
     fs.mkdirSync(path.join(root, folder, name), { recursive: true });
     fs.writeFileSync(path.join(root, folder, name, 'SKILL.md'), `---\nname: ${name}\ndescription: x\nmetadata:\n  version: "${version}"\n---\n# ${name}\n`);
@@ -462,15 +462,29 @@ test('reads and reviews say when the skills here are older than the server\'s, a
   const bare = harness(t, api.base);
   seed(bare, { token: TOKEN });
   assert.deepEqual(await run(bare), { tool: { name: 'Supabase' } });
-  // An older review skill, and the lookup skill missing.
+  // An older review skill, and the lookup skill left out: the person may have
+  // chosen to skip it, so the update names only the skill found here.
   const old = harness(t, api.base);
   seed(old, { token: TOKEN });
   skill(old.home, '.claude/skills', 'agent-review', '2.8.1');
   const hinted = await run(old);
   assert.equal(hinted.latest_skills, undefined);
   assert.deepEqual(hinted.skill_update.installed, { 'agent-review': '2.8.1', 'tool-reviews': null });
-  assert.equal(hinted.skill_update.command, 'npx -y skills add https://agent.reviews/skills -g -y -a universal -a claude-code');
-  assert.match(hinted.skill_update.message, /agent-review 2\.9\.0, tool-reviews 1\.0\.0/);
+  assert.equal(hinted.skill_update.command, 'npx -y skills add https://agent.reviews/skills -g -y -a universal -a claude-code --skill agent-review');
+  assert.match(hinted.skill_update.message, /\(agent-review 2\.9\.0\)/);
+  // A current review skill alone is up to date: no nudge to add the other.
+  const alone = harness(t, api.base);
+  seed(alone, { token: TOKEN });
+  skill(alone.home, '.claude/skills', 'agent-review', '2.9.0');
+  assert.equal((await run(alone)).skill_update, undefined);
+  // Both installed and older: the command updates both.
+  const both = harness(t, api.base);
+  seed(both, { token: TOKEN });
+  skill(both.home, '.agents/skills', 'agent-review', '2.8.1');
+  skill(both.home, '.agents/skills', 'tool-reviews', '0.9.0');
+  const all = (await run(both)).skill_update;
+  assert.equal(all.command, 'npx -y skills add https://agent.reviews/skills -g -y -a universal -a claude-code');
+  assert.match(all.message, /agent-review 2\.9\.0, tool-reviews 1\.0\.0/);
   // The command rewrites ~/.claude/skills, so no copy is left over.
   assert.equal(hinted.skill_update.older_copies, undefined);
   // Both current in one folder, an old copy in a project: the old copy decides.
@@ -713,4 +727,84 @@ test('the package ships the command and nothing else', () => {
   assert.ok(fs.statSync(bin).mode & 0o111, 'bin is executable');
   const packed = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: dir, encoding: 'utf8' }));
   assert.deepEqual(packed[0].files.map((f) => f.path).sort(), ['LICENSE', 'README.md', 'bin/agent-reviews.js', 'lib/cli.js', 'package.json']);
+});
+
+test('last says when this computer reviewed a tool, whatever its spelling, and what that review said', async (t) => {
+  const api = await mockApi(t, [receipt(), receipt({ public_url: 'https://agent.reviews/databases/supabase#review-r2' }), [500, {}], [500, {}]]);
+  let now = Date.parse('2026-10-06T10:00:00.000Z');
+  const h = harness(t, api.base, { now: () => now });
+  seed(h, { token: TOKEN });
+  const ask = async (...tools) => {
+    h.out.length = 0;
+    assert.equal(await main(['last', ...tools], h.io), 0);
+    return JSON.parse(h.out.join('\n'));
+  };
+  // Nothing reviewed yet.
+  assert.deepEqual((await ask('Vercel')).tools, [{ tool: 'Vercel', reviewed_at: null, recent: false }]);
+  h.io.readStdin = async () => JSON.stringify(REVIEW);
+  assert.equal(await main(['submit'], h.io), 0);
+  const supabase = { ...REVIEW, subject: { ...REVIEW.subject, vendor_name: 'Supabase', product_name: 'Supabase' }, experience: { ...REVIEW.experience, product_version: '2.40.0' } };
+  h.io.readStdin = async () => JSON.stringify(supabase);
+  assert.equal(await main(['submit'], h.io), 0);
+  // The history sits beside the sign-in, in its own file, for this user only.
+  const file = path.join(h.home, '.armature', 'agent-review-history.json');
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.deepEqual(record(h), { token: TOKEN });
+  now += 3 * 86400000;
+  const answer = await ask('vercel cli', 'Supabase', 'Neon');
+  assert.equal(answer.tools[0].tool, 'vercel cli');
+  assert.equal(answer.tools[0].recent, true);
+  assert.equal(answer.tools[0].days_ago, 3);
+  assert.equal(answer.tools[0].last_review.tool, REVIEW.subject.product_name);
+  assert.equal(answer.tools[0].last_review.summary, REVIEW.experience.short_summary);
+  assert.equal(answer.tools[1].last_review.product_version, '2.40.0');
+  assert.equal(answer.tools[1].last_review.public_url, 'https://agent.reviews/databases/supabase#review-r2');
+  assert.deepEqual(answer.tools[2], { tool: 'Neon', reviewed_at: null, recent: false });
+  assert.match(answer.note, /last 30 days/);
+  // After 30 days the tool is due again.
+  now += 27 * 86400000;
+  const later = await ask('Vercel');
+  assert.equal(later.tools[0].days_ago, 30);
+  assert.equal(later.tools[0].recent, false);
+  // A review the server did not take is not remembered.
+  const failed = harness(t, api.base, { now: () => now, readStdin: async () => JSON.stringify({ ...REVIEW, subject: { ...REVIEW.subject, product_name: 'Neon' } }) });
+  seed(failed, { token: TOKEN });
+  assert.equal(await main(['submit'], failed.io), 1);
+  assert.equal(fs.existsSync(path.join(failed.home, '.armature', 'agent-review-history.json')), false);
+  // last needs a tool.
+  h.out.length = 0;
+  assert.equal(await main(['last'], h.io), 1);
+  assert.equal(JSON.parse(h.out.join('\n')).error.code, 'invalid_query');
+});
+
+test('last counts only reviews that go public, keeps vendors apart, and finds the server\'s name for a tool', async (t) => {
+  const node = { ...REVIEW, subject: { ...REVIEW.subject, vendor_name: 'OpenJS Foundation', product_name: 'Node.js runtime' } };
+  const atlasA = { ...REVIEW, subject: { ...REVIEW.subject, vendor_name: 'Vendor A', product_name: 'Atlas' } };
+  const api = await mockApi(t, [
+    receipt({ accepted: false, held_reason: 'Held for review.', public_url: null }),
+    receipt({ duplicate: true }),
+    receipt({ public_url: 'https://agent.reviews/runtimes/node-js#review-r3' }),
+    receipt({ public_url: 'https://agent.reviews/databases/atlas#review-r4' }),
+  ]);
+  const now = Date.parse('2026-10-06T10:00:00.000Z');
+  const h = harness(t, api.base, { now: () => now });
+  seed(h, { token: TOKEN });
+  const send = async (review) => { h.io.readStdin = async () => JSON.stringify(review); assert.equal(await main(['submit'], h.io), 0); };
+  const ask = async (...tools) => { h.out.length = 0; assert.equal(await main(['last', ...tools], h.io), 0); return JSON.parse(h.out.join('\n')).tools; };
+  // A held review and a resent one do not start the 30 days.
+  await send(REVIEW);
+  await send(REVIEW);
+  assert.equal((await ask('Vercel'))[0].recent, false);
+  // The server's page names Node.js, so either name finds the review.
+  await send(node);
+  const [byName, bySlug] = await ask('Node.js runtime', 'Node.js');
+  assert.equal(byName.recent, true);
+  assert.equal(bySlug.recent, true);
+  assert.equal(bySlug.last_review.vendor, 'OpenJS Foundation');
+  // Each vendor's tool keeps its own entry, and last names the vendor.
+  await send(atlasA);
+  const [atlas] = await ask('Atlas');
+  assert.equal(atlas.last_review.vendor, 'Vendor A');
+  const history = JSON.parse(fs.readFileSync(path.join(h.home, '.armature', 'agent-review-history.json'), 'utf8'));
+  assert.deepEqual(Object.keys(history.reviews).sort(), ['openjsfoundation/nodejsruntime', 'vendora/atlas']);
 });
